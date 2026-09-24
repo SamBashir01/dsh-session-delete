@@ -8,9 +8,15 @@ only runs inside the DeepSeek Harness web runtime.
 
 ## Install
 
-**From npm** — `dsh-session-delete` (TBD, first published release).
+**Requirements** — the DeepSeek Harness web runtime (tested against
+`@deepseek-ai/dsh@0.1.6-alpha.x`). The bundled download item re-drives the shipped
+`@deepseek-ai/dsh-session-log-export`; without that plugin the menu degrades to **Delete only**.
 
-**From git** — `github:sambashir001/dsh-session-delete#v0.1.0`.
+**From npm** — not currently published: the name `dsh-session-delete` is already taken on the
+npm registry (by an unrelated package), so no scoped release exists yet. Install from git or the
+bundled profile below.
+
+**From git** — `github:sambashir01/dsh-session-delete#v0.1.0`.
 
 Install through the Harness **Plugins** page, the CLI (`dsh plugin --profile <name> add
 <spec>`), or from an agent session with `plugin_manager install_bundle <spec>`.
@@ -31,7 +37,7 @@ Open a conversation → header **⋯** → **Download session log** | **Delete s
 - **Download session log** re-drives DSH's own export service. The shipped standalone button
   is shadowed, so you always see exactly one ⋯ carrying both items.
 - **Delete session** opens a risk dialogue that must be acknowledged (this is permanent). On
-  confirm the plugin navigates away, calls `POST /api/session.delete`, and permanently removes:
+  confirm the plugin navigates away, calls `POST /api/session.delete`, and removes:
   - the session directory and its whole sub-session lineage
     (`${DSH_HOME}/sessions/<project>/<encoded-id>`),
   - workspace rows and the archive marker for **every** deleted id (root + descendants), so no
@@ -54,12 +60,16 @@ Delete only. Disabling this plugin restores the original button automatically.
   in memory: the engine keeps resumed sessions resident for the host's lifetime, so a residency
   check would make every previously-opened session undeletable.
 - **Provability before removal** — the JSONL backend's `projectKey`/`encodeSegment` path
-  mapping is replicated exactly, then each directory is stat'ed and layout-checked (must
-  contain `*.jsonl`/`*.jsonl.zstd` or `session.lock`) before anything is removed. A path that
-  cannot be proven to be a session folder is refused.
+  mapping is replicated exactly, then each directory is stat'ed, layout-checked (must contain
+  `*.jsonl`/`*.jsonl.zstd` or `session.lock`), and resolved through any symlinks (a path that
+  redirects outside the sessions root, or whose final component is itself a symlink, is refused)
+  before anything is removed. A path that cannot be proven to be a session folder is refused,
+  and any stat/readdir failure other than "already gone" aborts the delete (never false success).
 - **Already-gone is fine** — a missing folder (never flushed, or already removed by an
-  overlapping delete) is treated as deleted and cleaned out of the registries; deleting again
-  is idempotent and returns success. 404 is reserved for an unknown session id.
+  overlapping delete), or an id the backend no longer knows, is treated as deleted: the host
+  returns success and the registries are cleaned, so deleting again is idempotent. Because the
+  host answers success for unknown ids, a non-2xx response is always a real failure (a missing
+  endpoint can never be mistaken for "done").
 - **Attachments are untouched** — attachments live in a global content-addressed pool and are
   intentionally not freed by deletion.
 - **Auth** — the route rides the same browser-session connection auth as session export and
@@ -69,9 +79,16 @@ Delete only. Disabling this plugin restores the original button automatically.
 
 - Deleting the open session navigates away first (the host cannot dispose an open session it
   does not own); on failure it is best-effort reopened so the error shows in its own header
-  dialog.
-- After a delete the folder and registry rows are gone, but the session's in-memory agent
-  object (if any) lingers until host restart. It is inert: opening it reports "not found".
+  dialog. If you navigate elsewhere yourself during the ~6 s waiting window, the failure path
+  will still return you to the session being deleted — accepted, because it is the only place
+  its error dialog can render.
+- After a delete the folder and registry rows are gone, but the engine's in-memory session /
+  agent store entry (if any) persists until the DSH host restarts — the plugin cannot dispose
+  engine-owned objects. It is detached from the UI and a repeat delete reports "already gone";
+  the only residual risk is a live writer touching the resident entry after deletion, which the
+  running-guard blocks while a turn is running.
+- The workspace sidebar can briefly show a ghost row for the deleted session until the next
+  re-index; it is inert (opening reports "not found") and a repeat delete stays idempotent.
 - SQLite session-query rows are reconciled from disk by the engine; this plugin performs no
   FTS cleanup.
 

@@ -1,15 +1,18 @@
 {
   "name": "dsh-session-delete",
   "version": "0.1.0",
-  "description": "Permanently delete a Session from the DeepSeek Harness Web UI",
+  "description": "Delete a session from the DeepSeek Harness Web UI",
   "license": "MIT",
   "private": true,
   "type": "module",
   "main": "./index.js",
   "exports": { ".": "./index.js", "./client": "./client.js", "./package.json": "./package.json" },
   "files": ["index.js", "client.js", "cordis.patch.yml", "README.md", "LICENSE", "CHANGELOG.md"],
-  "repository": { "type": "git", "url": "git+https://github.com/sambashir001/dsh-session-delete.git" },
-  "homepage": "https://github.com/sambashir001/dsh-session-delete",
+  "author": "sambashir01",
+  "keywords": ["dsh", "harness", "plugin", "session", "delete", "deepseek"],
+  "engines": { "node": ">=18" },
+  "repository": { "type": "git", "url": "git+https://github.com/sambashir01/dsh-session-delete.git" },
+  "homepage": "https://github.com/sambashir01/dsh-session-delete",
   "publishConfig": { "access": "public" },
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },
@@ -24,6 +27,8 @@
     }
   },
   "scripts": {
-    "check": "node --check index.js && node --check client.js"
+    "check": "node --check index.js && node --check client.js",
+    "prepublishOnly": "npm run check",
+    "test": "node --test test/host.test.mjs"
   }
 }

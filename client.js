@@ -70,14 +70,17 @@ window.__ModuleLoader__.load({
 							body: JSON.stringify({ sessionId: String(sessionId) })
 						});
 					}
-					// 404 = the id is already gone (previously-deleted ghost or stale row).
-					// The end state is the same as success, so treat a re-delete as
-					// idempotent success (matches the host: missing folders are already-gone
-					// and report success). No reopen: the session does not exist to reopen.
-					if (response.status === 404) {
-						this.publish(sessionId, null);
-						return;
+					// Retries exhausted while an agent is still running on this session
+					// or a descendant. Report this concretely (localized in the dialog)
+					// instead of a bare "HTTP 409".
+					if (response.status === 409) {
+						const busy = new Error("agent still running on session");
+						busy.code = "SESSION_BUSY";
+						throw busy;
 					}
+					// The host reports an unknown/already-removed id as success, so a
+					// 404 here can only mean a real failure (endpoint missing, e.g.
+					// host plugin not loaded) — it must never be mistaken for success.
 					if (!response.ok) {
 						const detail = await response.text().catch(() => "");
 						throw new Error(`Delete failed: HTTP ${response.status}${detail === "" ? "" : ` ${detail}`}`);
@@ -96,10 +99,12 @@ window.__ModuleLoader__.load({
 					// connection failure), not a server verdict — surface a human-readable
 					// message instead of the raw engine text ("Failed to fetch").
 					const network = error instanceof TypeError;
-					this.publish(sessionId, { phase: "error", error: network ? null : messageOf(error), network });
+					const busy = error?.code === "SESSION_BUSY";
+					this.publish(sessionId, { phase: "error", error: network || busy ? null : messageOf(error), network, busy });
 				}
 			}
 			publish(sessionId, entry) {
+				if (this.disposed) return;
 				this.store.update((state) => {
 					const next = { ...state.bySession };
 					if (entry === null || entry === void 0) delete next[String(sessionId)];
@@ -130,14 +135,21 @@ window.__ModuleLoader__.load({
 				phase === "error"
 					? deleteEntry?.network
 						? t("dialog.networkError")
-						: deleteEntry?.error ?? t("dialog.commandFailed")
+						: deleteEntry?.busy
+							? t("dialog.busy")
+							: deleteEntry?.error ?? t("dialog.commandFailed")
 					: null;
 			const downloadHook = useSessionLogDownload ?? noopHook;
 			const downloadEntry = downloadHook((state) => state.bySession[String(sessionId)]);
 			const downloadStatus = downloadEntry?.status;
 			const downloadOpen = downloadEntry?.open === true;
 			const downloadError = downloadStatus === "error" ? downloadEntry?.error || t("dl.commandFailed") : null;
-			const hasDownload = requestDownload !== void 0 && dismissDownload !== void 0;
+			// Gate on the actual presence of the shared download controller, not on
+			// function identity: the accessor props below are always functions (they
+			// wrap `download?.…`), so testing them for non-undefined would always
+			// pass. `hasDownload` comes from inject() as a real boolean — when
+			// dsh-session-log-export is absent the menu degrades to Delete-only.
+			const hasDownload = props.hasDownload === true;
 			const downloadBusy = hasDownload && downloadStatus === "downloading";
 			const [moreOpen, setMoreOpen] = react.useState(false);
 			const [dangerOpen, setDangerOpen] = react.useState(false);
@@ -275,7 +287,8 @@ window.__ModuleLoader__.load({
 			"confirm.close": "关闭",
 			"confirm.confirm": "永久删除",
 			"dialog.errorTitle": "删除失败",
-			"dialog.networkError": "网络错误 — 无法确认会话状态，会话未被删除。请检查连接后重试。",
+			"dialog.networkError": "网络错误 — 请求未到达服务器，无法确认会话是否已删除。请检查连接后重试。",
+			"dialog.busy": "此会话或其子会话仍在运行任务 — 请稍候再试。",
 			"dialog.close": "关闭",
 			"dialog.commandFailed": "无法删除此会话。"
 		};
@@ -298,7 +311,8 @@ window.__ModuleLoader__.load({
 			"confirm.close": "Close",
 			"confirm.confirm": "Delete permanently",
 			"dialog.errorTitle": "Delete failed",
-			"dialog.networkError": "Network error — could not confirm session status; the session was not deleted. Check the connection and try again.",
+			"dialog.networkError": "Network error — the request never reached the harness, so it is unclear whether the session was deleted. Check the connection and try again.",
+			"dialog.busy": "This session (or one of its sub-sessions) is still running a task — try again shortly.",
 			"dialog.close": "Close",
 			"dialog.commandFailed": "Could not delete this session."
 		};
@@ -337,6 +351,7 @@ window.__ModuleLoader__.load({
 									sessionDelete: controller.store,
 									sessionLogDownload: download?.store
 								},
+								hasDownload: download !== void 0,
 								request: (sessionId) => controller.requestDelete(ctx, sessionId),
 								dismiss: (sessionId) => {
 									controller.dismiss(sessionId);

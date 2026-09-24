@@ -1,13 +1,15 @@
-import { stat, readdir, rm } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { stat, lstat, readdir, realpath, rm } from "node:fs/promises";
+import { join, resolve, sep, basename } from "node:path";
 import { homedir } from "node:os";
 
 const name = "session-delete";
-const inject = ["connection", "sessions", "agents", "sessionPersistence", "workspaceRegistry"];
+const inject = ["connection", "agents", "sessionPersistence", "workspaceRegistry"];
 
 const DELETE_SESSION_PATH = "/api/session.delete";
-const SETTLE_MS = 6000;
-const POLL_MS = 50;
+// Settle/poll knobs. Overridable via env so the destructive-path tests run fast;
+// production hosts keep the defaults (the tests clamp them to small values).
+const SETTLE_MS = Number(process.env.DSH_SESSION_DELETE_SETTLE_MS) >= 1 ? Number(process.env.DSH_SESSION_DELETE_SETTLE_MS) : 6000;
+const POLL_MS = Number(process.env.DSH_SESSION_DELETE_POLL_MS) >= 1 ? Number(process.env.DSH_SESSION_DELETE_POLL_MS) : 50;
 const ID_PATTERN = /^[A-Za-z0-9._-]{1,300}$/;
 
 export { name, inject, apply };
@@ -131,6 +133,10 @@ async function waitUntilCold(ctx, ids, signal, label) {
 	// store residency would make it impossible to delete any session that was
 	// ever opened. Residency is deliberately ignored; only an in-flight turn
 	// (agent.status === "running") blocks deletion.
+	// FAIL CLOSED: without the agents service there is no observable in-flight
+	// turn, so coldness cannot be proven — refuse rather than delete ungated on a
+	// destructive route.
+	if (ctx.agents === void 0) throw new HttpError(503, "agent runtime is unavailable; refusing to delete without a running-guard");
 	const deadline = Date.now() + SETTLE_MS;
 	while (true) {
 		const live = ids.filter((id) => {
@@ -156,60 +162,119 @@ async function deleteSession(ctx, sessionId, signal) {
 	if (!Array.isArray(snapshots)) throw new HttpError(503, "session persistence backend is unavailable");
 	const byId = new Map(snapshots.map((snap) => [snap.header.id, snap]));
 	const target = byId.get(sessionId);
-	if (target === void 0) throw new HttpError(404, "session not found");
+	if (target === void 0) {
+		// Unknown id == already gone. Treat it as success (idempotent, matching
+		// missing-folder semantics): the end state we were asked for already holds,
+		// a re-delete of a just-removed ghost must not error, and the client can
+		// trust that any non-2xx response is a REAL failure (a missing endpoint can
+		// never be mistaken for success).
+		return { ok: true, deleted: [sessionId] };
+	}
 	const ids = [sessionId, ...collectSubtree(descendantsByParent(snapshots), sessionId)];
-	await waitUntilCold(ctx, ids, signal, sessionId);
 
+	// A single running-guard pass runs right before removal; none is needed up
+	// here. (Any first pass cannot close a turn that only starts after it, so an
+	// earlier pass would just add up to another SETTLE_MS of latency.)
 	const rawRoot = persistence.config?.root ?? persistence.root;
 	const root = typeof rawRoot === "string" && rawRoot.length > 0 ? resolve(rawRoot) : defaultRoot();
+	const rootDir = sessionDir(root, target.header?.cwd, sessionId);
+	// Canonical sessions root, resolved once: a legitimately symlinked root (eg.
+	// ~/.dsh/sessions on another disk) must still pass the per-dir "inside root"
+	// check below, while a symlink on a dir's own path must not.
+	let realRoot;
+	try {
+		realRoot = await realpath(root);
+	} catch (error) {
+		if (error?.code === "ENOENT") realRoot = resolve(root);
+		else throw error;
+	}
 	const dirs = [];
 	for (const id of ids) {
 		const dir = sessionDir(root, byId.get(id)?.header?.cwd, id);
-		const info = await stat(dir).catch(() => void 0);
-		// A missing folder is NOT an error: sessions that were never flushed have no
-		// directory yet, and an overlapping concurrent delete may already have removed
-		// a descendant's dir. We still tear the (possibly root) id out of the
-		// registries below; a gone root dir just means there is nothing to remove.
+		// Only ENOENT means "already gone" (never-flushed, or removed by an
+		// overlapping concurrent delete). Any other stat/readdir error (EACCES,
+		// EIO, …) is NOT a permission to proceed: failing to read a folder we are
+		// about to rm must abort the delete, never report false success.
+		const info = await stat(dir).catch((error) => {
+			if (error?.code === "ENOENT") return void 0;
+			throw error;
+		});
 		if (info === void 0 || !info.isDirectory()) continue;
-		const entries = await readdir(dir).catch(() => []);
+		const entries = await readdir(dir).catch((error) => {
+			if (error?.code === "ENOENT") return [];
+			throw error;
+		});
 		// Provability guard: never remove a path we cannot prove is a session folder
 		// (must contain a jsonl/jsonl.zstd log or a session.lock). This is the last
 		// line of defence against a wrong layout/encoding passing the id checks.
 		if (!entries.some((entry) => /\.jsonl(\.zstd)?$/.test(entry) || entry === "session.lock")) {
 			throw new HttpError(409, "refusing to delete a path that is not a session directory");
 		}
+		// Symlink hardening: `stat` follows links, so a symlink swap (on the dir or
+		// any of its ancestors) would pass the checks above while `rm` could unlink
+		// just a link — "deleted" without deleting. Resolve canonically and require
+		// the real path to be the encoded id inside the canonical sessions root, and
+		// reject a final component that is itself a symlink.
+		const real = await realpath(dir).catch((error) => {
+			if (error?.code === "ENOENT") return void 0;
+			throw error;
+		});
+		if (real === void 0) continue; // vanished concurrently (overlapping delete)
+		let link;
+		try {
+			link = await lstat(dir);
+		} catch (error) {
+			if (error?.code === "ENOENT") continue;
+			throw error;
+		}
+		if (link.isSymbolicLink() || !real.startsWith(realRoot + sep) || basename(real) !== encodeSegment(id)) {
+			throw new HttpError(409, "refusing to delete a path that is not a real session directory");
+		}
 		dirs.push(dir);
 	}
-	// Re-check the running-guard right before removal: shrinks the window in which a
-	// turn could start between the first guard pass and the rm loop.
+	// The single authoritative running-guard pass, immediately before removal. (A
+	// turn that starts after it cannot be closed by any earlier pass, so one pass
+	// here is both necessary and sufficient — and keeps the worst-case server-side
+	// wait to a single SETTLE_MS, inside the client's retry budget.)
 	await waitUntilCold(ctx, ids, signal, sessionId);
-	for (const dir of dirs) {
-		// Content-addressed attachments (~/.dsh/attachments/v1) are intentionally
-		// never touched: they are shared storage, not the session's own files.
-		await rm(dir, { recursive: true, force: true });
+	// Remove children before the root, and abort BEFORE the root if any removal
+	// fails: the root folder (the discoverable id) must survive a partial failure
+	// so a retry still finds it and can reach every leftover folder — no orphans
+	// that have become unreachable. Content-addressed attachments
+	// (~/.dsh/attachments/v1) are intentionally never touched: they are shared
+	// storage, not the session's own files.
+	for (let i = dirs.length - 1; i >= 0; i--) {
+		if (dirs[i] === rootDir) continue;
+		await rm(dirs[i], { recursive: true, force: true });
 	}
-	// Best-effort registry cleanup across EVERY deleted id (root + descendants), so
-	// sub-session ids can't survive as ghost rows in workspaces or the archive.
-	const wsr = ctx.workspaceRegistry;
-	if (wsr !== void 0) {
-		if (typeof wsr.list === "function") {
-			for (const ws of wsr.list()) {
-				const sessionIds = ws.sessionIds ?? [];
-				for (const id of ids) {
-					if (!sessionIds.includes(id)) continue;
-					await bestEffort(() => ws.detachSession(id));
-				}
+	await rm(rootDir, { recursive: true, force: true });
+	// Registry cleanup as ONE best-effort unit: a registry failure (including a
+	// throwing wsr.list — dsh-workspace raises when an order references a missing
+	// workspace) must never become an error AFTER the files are gone, which would
+	// make the response contradict the actual outcome. Registries are secondary to
+	// the removal, and the in-memory engine store entry (not disposable by a
+	// plugin) clears at host restart.
+	await bestEffort(async () => {
+		const wsr = ctx.workspaceRegistry;
+		if (wsr === void 0) return;
+		const workspaces = typeof wsr.list === "function" ? wsr.list() : [];
+		for (const ws of workspaces) {
+			const sessionIds = ws.sessionIds ?? [];
+			for (const id of ids) {
+				if (!sessionIds.includes(id)) continue;
+				await bestEffort(() => ws.detachSession(id));
 			}
 		}
 		for (const id of ids) await bestEffort(() => wsr.unarchiveSession(id));
-	}
+	});
 	return { ok: true, deleted: ids };
 }
 
 function apply(ctx) {
 	// Authenticated browser-session route (same trust class as /api/session.export),
 	// mirrored from it. Body is buffered so we control JSON parsing and error codes
-	// (400 malformed/missing, 404 unknown, 409 running or non-session dir, 500 other).
+	// (400 malformed/missing, 200-already-gone for an unknown id, 409 running or
+	// non-session dir, 500 other).
 	connectionOf(ctx).fetch.register({
 		path: DELETE_SESSION_PATH,
 		methods: ["POST"],
