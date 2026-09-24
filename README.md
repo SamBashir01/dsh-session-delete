@@ -16,7 +16,7 @@ only runs inside the DeepSeek Harness web runtime.
 npm registry (by an unrelated package), so no scoped release exists yet. Install from git or the
 bundled profile below.
 
-**From git** — `github:sambashir01/dsh-session-delete#v0.1.0`.
+**From git** — `github:sambashir01/dsh-session-delete#v0.1.1`.
 
 Install through the Harness **Plugins** page, the CLI (`dsh plugin --profile <name> add
 <spec>`), or from an agent session with `plugin_manager install_bundle <spec>`.
@@ -91,6 +91,36 @@ Delete only. Disabling this plugin restores the original button automatically.
   re-index; it is inert (opening reports "not found") and a repeat delete stays idempotent.
 - SQLite session-query rows are reconciled from disk by the engine; this plugin performs no
   FTS cleanup.
+
+## Testing
+
+Run the suite with `npm test` (Node ≥ 22 for `node --test`). Ships no dependencies; nothing
+touches a real DSH_HOME or a real service.
+
+Three files under `test/`:
+
+- **`host.test.mjs`** — the host `POST /api/session.delete` route, driven with fake services
+  and a scratch session root under `os.tmpdir()`: happy path deletes a session dir plus its
+  whole sub-session lineage and cleans workspace/archive rows; already-gone is idempotent
+  success; running-turns (409) and a missing agents runtime (503) refuse without removing
+  anything; non-session folders and symlinked paths are refused (409); a throwing
+  `workspaceRegistry.list()` can never turn success into error; malformed / missing / invalid
+  `sessionId` are 400; orphaned subtrees (parent header absent) still delete; and a failed
+  removal aborts **before** the session dir itself is removed so a retry finds everything
+  (exercised on macOS with `chflags uchg`, auto-skipped elsewhere).
+- **`drift.test.mjs`** — pins the replicated `projectKey`/`encodeSegment` path encoding — the
+  code that decides *which directory gets removed* — to a frozen snapshot of the real backend
+  source (`test/fixtures/session-path-0.1.6-alpha.2.txt`), for both the shipped copies in
+  `index.js` and the test-local copies in `test/path-map.mjs`, across a deterministic 2 000-case
+  fuzz corpus plus fixed regression anchors. Any behavioral divergence here is a
+  release-blocker: it means a delete targets the wrong directory.
+- **`i18n.test.mjs`** — asserts the `zh`/`en` locale dictionaries expose exactly the same key
+  set and that critical confirm / error / busy keys exist, so no locale ever silently loses a
+  label.
+
+> The drift fixture is a snapshot of module-private upstream source. **Regenerate it when the
+> DSH JSONL backend changes** (see the fixture header), then confirm the fuzz still agrees — or
+> the plugin must be updated to the new layout.
 
 ## Development
 

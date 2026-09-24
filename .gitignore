@@ -6,3 +6,7 @@ node_modules/
 
 # Logs
 *.log
+# Private planning docs — never stage these
+PLAN.md
+NOTES.md
+PUBLISHING.md

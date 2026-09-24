@@ -5,52 +5,17 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { mkdtemp, mkdir, writeFile, rm, symlink, readdir, stat } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { encodeSegment, projectKey, sessionPath } from "./path-map.mjs";
+// The one authoritative mapping used to build sandbox session dirs. Its fidelity to
+// the real backend is asserted separately by drift.test.mjs (frozen-source pin).
 
 // Must be set BEFORE the module is imported: the host reads the knobs at load time.
 process.env.DSH_SESSION_DELETE_SETTLE_MS = "150";
 process.env.DSH_SESSION_DELETE_POLL_MS = "5";
 const { apply } = await import("../index.js");
-
-// ---- Path mapping, re-derived here from the published JSONL layout ----
-// This mirrors (rather than imports) encodeSegment/projectKey so that if the
-// plugin's replicated mapping ever drifts from the backend layout, the delete will
-// fail to find the test folder we build at this independently-computed path.
-function encodeSegment(raw) {
-	if (raw.length === 0) throw new Error("empty segment");
-	if (raw === ".") return "~002E";
-	if (raw === "..") return "~002E~002E";
-	let out = "";
-	for (let i = 0; i < raw.length; i++) {
-		const code = raw.charCodeAt(i);
-		const ch = String.fromCharCode(code);
-		if (ch !== "~" && /^[A-Za-z0-9._-]$/.test(ch)) out += ch;
-		else out += "~" + code.toString(16).toUpperCase().padStart(4, "0");
-	}
-	return out;
-}
-function projectKey(cwd) {
-	if (cwd.length === 0) throw new Error("empty cwd");
-	let readable = "";
-	let separatorRun = false;
-	for (const ch of cwd) {
-		if (ch === "/" || ch === "\\" || ch === ":") {
-			if (!separatorRun) readable += "-";
-			separatorRun = true;
-		} else if (ch !== "~" && /^[A-Za-z0-9._-]$/.test(ch)) {
-			readable += ch;
-			separatorRun = false;
-		} else {
-			readable += "~" + ch.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0");
-			separatorRun = false;
-		}
-	}
-	return `--${(readable.replace(/^-+/, "") || "root").slice(0, 251)}--`;
-}
-function sessionPath(root, cwd, id) {
-	return join(root, projectKey(cwd), encodeSegment(id));
-}
 
 // ---- Fixture: fake ctx + captured route handler ----
 async function freshRoot() {
@@ -88,7 +53,17 @@ function makeHarness({ snapshots = [], rows = [], agents, registryListThrows = f
 				body: JSON.stringify({ sessionId })
 			})
 		);
-	return { ctx, state, call };
+	// Raw body variant so validation behavior (malformed JSON, missing field) can
+	// be driven exactly as the client would send it.
+	const callRaw = (rawBody) =>
+		state.registered(
+			new Request("http://harness/api/session.delete", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: rawBody
+			})
+		);
+	return { ctx, state, call, callRaw };
 }
 
 async function makeSessionDir(root, cwd, id, contents = ["messages.jsonl"]) {
@@ -226,6 +201,98 @@ test("a throwing workspaceRegistry.list() cannot turn success into an error", as
 		assert.deepEqual(await res.json(), { ok: true, deleted: [ROOT_ID] });
 		await assert.rejects(stat(sessionPath(root, CWD, ROOT_ID)), { code: "ENOENT" });
 	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("400 on malformed / missing / invalid sessionId", async () => {
+	const root = await freshRoot();
+	try {
+		const har = makeHarness({ snapshots: [], agents: true });
+		har.ctx.sessionPersistence.root = root;
+
+		// Malformed JSON body.
+		const a = await har.callRaw("{not json");
+		assert.equal(a.status, 400);
+		assert.deepEqual(await a.json(), { error: "invalid JSON body" });
+
+		// Absent sessionId field.
+		const b = await har.callRaw("{}");
+		assert.equal(b.status, 400);
+		assert.deepEqual(await b.json(), { error: "missing sessionId" });
+
+		// Non-string sessionId.
+		const c = await har.callRaw(JSON.stringify({ sessionId: 42 }));
+		assert.equal(c.status, 400);
+
+		// Violates ID_PATTERN (space).
+		const d = await har.callRaw(JSON.stringify({ sessionId: "bad id!" }));
+		assert.equal(d.status, 400);
+		assert.deepEqual(await d.json(), { error: "invalid session id" });
+
+		// Over-length id (300 char cap).
+		const e = await har.callRaw(JSON.stringify({ sessionId: "x".repeat(301) }));
+		assert.equal(e.status, 400);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("deletes an orphaned subtree even when the parent header is absent", async () => {
+	const root = await freshRoot();
+	try {
+		// The parent session's header is missing (e.g. already archived / purged)
+		// yet the child + grandchild folders exist on disk.
+		const GRAND_ID = "sess-grand-3";
+		await makeSessionDir(root, CWD, CHILD_ID);
+		await makeSessionDir(root, CWD, GRAND_ID);
+		const snapshots = [
+			{ header: { id: CHILD_ID, cwd: CWD, parentSession: "missing-parent-9" } },
+			{ header: { id: GRAND_ID, cwd: CWD, parentSession: CHILD_ID } }
+		];
+		const har = makeHarness({ snapshots, rows: [CHILD_ID, GRAND_ID] });
+		har.ctx.sessionPersistence.root = root;
+
+		const res = await har.call(CHILD_ID);
+		assert.equal(res.status, 200);
+		assert.deepEqual(await res.json(), { ok: true, deleted: [CHILD_ID, GRAND_ID] });
+		await assert.rejects(stat(sessionPath(root, CWD, CHILD_ID)), { code: "ENOENT" });
+		await assert.rejects(stat(sessionPath(root, CWD, GRAND_ID)), { code: "ENOENT" });
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+// macOS can force `rm` to fail by setting the immutable flag (chflags uchg) on a
+// file. That lets us prove the abort-before-root contract: when the removal of a
+// descendant fails, the session's own folder (the discoverable id) must survive so
+// a retry still finds and removes everything — no unreachable orphans.
+test("a failed removal leaves the session dir intact (abort before root)", async (t) => {
+	if (process.platform !== "darwin") {
+		t.skip("forcing rm to fail needs chflags(2) (macOS only)");
+		return;
+	}
+	const root = await freshRoot();
+	let locked = null;
+	try {
+		const dir = await makeSessionDir(root, CWD, ROOT_ID, ["messages.jsonl", "ledger.jsonl"]);
+		locked = join(dir, "ledger.jsonl");
+		const set = spawnSync("/usr/bin/chflags", ["uchg", locked]);
+		if (set.error !== void 0 || set.status !== 0) {
+			t.skip("chflags unavailable on this macOS/filesystem");
+			return;
+		}
+		const snapshots = [{ header: { id: ROOT_ID, cwd: CWD } }];
+		const har = makeHarness({ snapshots });
+		har.ctx.sessionPersistence.root = root;
+
+		const res = await har.call(ROOT_ID);
+		assert.equal(res.status, 500); // the locked file made rm fail
+		// The root folder must still exist and still contain the locked file:
+		// the delete aborted BEFORE removing rootDir.
+		assert.ok((await readdir(dir)).includes("ledger.jsonl"));
+	} finally {
+		if (locked !== null) spawnSync("/usr/bin/chflags", ["nouchg", locked]);
 		await rm(root, { recursive: true, force: true });
 	}
 });

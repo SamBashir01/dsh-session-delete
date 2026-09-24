@@ -29,6 +29,6 @@
   "scripts": {
     "check": "node --check index.js && node --check client.js",
     "prepublishOnly": "npm run check",
-    "test": "node --test test/host.test.mjs"
+    "test": "node --test test/host.test.mjs test/drift.test.mjs test/i18n.test.mjs"
   }
 }

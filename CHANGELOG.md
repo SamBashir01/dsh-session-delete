@@ -6,6 +6,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Test suite (`npm test` now runs 15 tests in three files):
+  - `test/host.test.mjs` — sandboxed host-route tests against fake services and a scratch
+    session root: happy-path lineage delete, idempotent already-gone, 409/503 guard failures,
+    non-session-folder and symlink refusal, throwing-registry resilience, 400 validation,
+    orphaned-subtree delete, and abort-before-root on failed removal (`chflags`, macOS-gated).
+  - `test/drift.test.mjs` — pins the replicated `projectKey`/`encodeSegment` path encoding to
+    a frozen snapshot of the JSONL backend source (`test/fixtures/`), fuzzed over a
+    deterministic 2 000-case corpus for both the shipped and the test-local copies.
+  - `test/i18n.test.mjs` — asserts `zh`/`en` locale dictionaries expose identical key sets and
+    critical keys exist.
+- README "Testing" section documenting how to run the suite and when to regenerate the drift
+  fixture.
+
 ## [0.1.0] - 2026-09-24
 
 ### Added
