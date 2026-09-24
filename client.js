@@ -11,6 +11,12 @@ window.__ModuleLoader__.load({
 
 		const NS = "session-delete";
 		const INITIAL = { bySession: {} };
+		// Give the new-session preview a moment to settle after navigating away before
+		// the delete request runs: the header for the target view must be mounted
+		// before request state is read back, and reopening on failure needs a settled
+		// view. A fixed window (not a navigation promise) keeps this simple; the swap
+		// completes well inside this bound on the supported runtime.
+		const NAVIGATE_SETTLE_MS = 400;
 
 		function messageOf(error) {
 			return error instanceof Error ? error.message : String(error);
@@ -47,7 +53,7 @@ window.__ModuleLoader__.load({
 					// best-effort reopen it so the error shows in its own header dialog.
 					await ctx.uiWorkspace.startSession();
 					navigated = true;
-					await sleep(400);
+					await sleep(NAVIGATE_SETTLE_MS);
 					let response = await fetch(`${hostBase()}/api/session.delete`, {
 						method: "POST",
 						headers: { "content-type": "application/json" },
@@ -64,6 +70,14 @@ window.__ModuleLoader__.load({
 							body: JSON.stringify({ sessionId: String(sessionId) })
 						});
 					}
+					// 404 = the id is already gone (previously-deleted ghost or stale row).
+					// The end state is the same as success, so treat a re-delete as
+					// idempotent success (matches the host: missing folders are already-gone
+					// and report success). No reopen: the session does not exist to reopen.
+					if (response.status === 404) {
+						this.publish(sessionId, null);
+						return;
+					}
 					if (!response.ok) {
 						const detail = await response.text().catch(() => "");
 						throw new Error(`Delete failed: HTTP ${response.status}${detail === "" ? "" : ` ${detail}`}`);
@@ -78,7 +92,11 @@ window.__ModuleLoader__.load({
 							/* reopen is best-effort */
 						}
 					}
-					this.publish(sessionId, { phase: "error", error: messageOf(error) });
+					// A TypeError here is a network failure (fetch throws TypeError on
+					// connection failure), not a server verdict — surface a human-readable
+					// message instead of the raw engine text ("Failed to fetch").
+					const network = error instanceof TypeError;
+					this.publish(sessionId, { phase: "error", error: network ? null : messageOf(error), network });
 				}
 			}
 			publish(sessionId, entry) {
@@ -108,7 +126,12 @@ window.__ModuleLoader__.load({
 			const noopHook = () => void 0;
 			const deleteEntry = useSessionDelete((state) => state.bySession[String(sessionId)]);
 			const phase = deleteEntry?.phase;
-			const error = phase === "error" ? deleteEntry?.error ?? t("dialog.commandFailed") : null;
+			const error =
+				phase === "error"
+					? deleteEntry?.network
+						? t("dialog.networkError")
+						: deleteEntry?.error ?? t("dialog.commandFailed")
+					: null;
 			const downloadHook = useSessionLogDownload ?? noopHook;
 			const downloadEntry = downloadHook((state) => state.bySession[String(sessionId)]);
 			const downloadStatus = downloadEntry?.status;
@@ -146,7 +169,7 @@ window.__ModuleLoader__.load({
 						items,
 						onSelect: (id) => {
 							setMoreOpen(false);
-							if (id === "download") requestDownload(sessionId);
+							if (id === "download") requestDownload(sessionId)?.catch(() => {});
 							else if (id === "delete") {
 								setAcked(false);
 								setDangerOpen(true);
@@ -252,6 +275,7 @@ window.__ModuleLoader__.load({
 			"confirm.close": "关闭",
 			"confirm.confirm": "永久删除",
 			"dialog.errorTitle": "删除失败",
+			"dialog.networkError": "网络错误 — 无法确认会话状态，会话未被删除。请检查连接后重试。",
 			"dialog.close": "关闭",
 			"dialog.commandFailed": "无法删除此会话。"
 		};
@@ -274,6 +298,7 @@ window.__ModuleLoader__.load({
 			"confirm.close": "Close",
 			"confirm.confirm": "Delete permanently",
 			"dialog.errorTitle": "Delete failed",
+			"dialog.networkError": "Network error — could not confirm session status; the session was not deleted. Check the connection and try again.",
 			"dialog.close": "Close",
 			"dialog.commandFailed": "Could not delete this session."
 		};
@@ -288,6 +313,11 @@ window.__ModuleLoader__.load({
 			ctx.provide("sessionDelete", controller);
 			ctx.effect(() => async () => {
 				await controller.dispose();
+				// Remove the injected <style> so disable/HMR unload leaves no dangling
+				// plugin style element behind (same lookup the injection uses).
+				if (typeof document !== "undefined") {
+					document.querySelector("style[data-plugin-css='" + styleId + "']")?.remove();
+				}
 			}, "session-delete: browser delete lifecycle");
 			ctx.effect(() => ctx.locale.register(NS, { zh, en }), "session-delete: browser dictionaries");
 			// Shadow the shipped `session-log-download` cell: same id, lower priority
